@@ -41,6 +41,7 @@ def slope2rot(slope):
   cos = np.sqrt(1 / (slope ** 2 + 1))
   return np.array([[cos, -sin], [sin, cos]])
 
+
 MIN_LAG_VEL = 15.0
 MAX_SANE_LAG = 3.0
 MIN_HIST_LEN_SEC = 30
@@ -50,19 +51,19 @@ MOVING_CORR_WINDOW = 30
 OVERLAP_FACTOR = 0.25
 
 class LagEstimator(ParameterEstimator):
-  def __init__(self, CP, dt):
+  def __init__(self, CP, dt, min_hist_len_sec, max_hist_len_sec, max_lag_hist_len_sec, moving_corr_window, overlap_factor):
     self.dt = dt
-    self.min_hist_len = int(MIN_HIST_LEN_SEC / self.dt)
-    self.window_len = int(MOVING_CORR_WINDOW / self.dt)
-    self.initial_lag = CP.steerActuatorDelay
+    self.min_hist_len = int(min_hist_len_sec / self.dt)
+    self.window_len = int(moving_corr_window / self.dt)
+    self.initial_lag = ntune_common_get('steerActuatorDelay') + .2
     self.current_lag = self.initial_lag
 
     self.lat_active = False
     self.steering_pressed = False
     self.v_ego = 0.0
-    self.lags = deque(maxlen= int(MAX_LAG_HIST_LEN_SEC / (MOVING_CORR_WINDOW * OVERLAP_FACTOR)))
-    self.curvature = deque(maxlen=int(MAX_HIST_LEN_SEC / self.dt))
-    self.desired_curvature = deque(maxlen=int(MAX_HIST_LEN_SEC / self.dt))
+    self.lags = deque(maxlen= int(max_lag_hist_len_sec / (moving_corr_window * overlap_factor)))
+    self.curvature = deque(maxlen=int(max_hist_len_sec / self.dt))
+    self.desired_curvature = deque(maxlen=int(max_hist_len_sec / self.dt))
     self.frame = 0
 
   def correlation_lags(self, sig_len, dt):
@@ -103,10 +104,13 @@ class LagEstimator(ParameterEstimator):
         _, curvature = zip(*self.curvature)
         _, desired_curvature = zip(*self.desired_curvature)
         delay_curvature, _ = self.actuator_delay(curvature[-self.window_len:], desired_curvature[-self.window_len:], self.dt)
-
         if delay_curvature != 0.0:
           self.lags.append(delay_curvature)
-      steer_actuation_delay = float(np.mean(self.lags))
+      # FIXME: this is fragile and ugly, refactor this
+      if len(self.lags) > 0:
+        steer_actuation_delay = float(np.mean(self.lags))
+      else:
+        steer_actuation_delay = self.initial_lag
     else:
       steer_actuation_delay = self.initial_lag
 
@@ -132,7 +136,6 @@ class TorqueBuckets(PointBuckets):
 
 
 class TorqueEstimator(ParameterEstimator):
-
   @staticmethod
   def get_friction():
     return ntune_torque_get('friction')
@@ -162,8 +165,7 @@ class TorqueEstimator(ParameterEstimator):
     self.offline_friction = 0.0
     self.offline_latAccelFactor = 0.0
     self.resets = 0.0
-    #self.use_params = CP.brand in ALLOWED_CARS and CP.lateralTuning.which() == 'torque'
-    self.use_params = False
+    self.use_params = CP.brand in ALLOWED_CARS and CP.lateralTuning.which() == 'torque'
 
     if CP.lateralTuning.which() == 'torque':
       self.offline_friction = TorqueEstimator.get_friction()
@@ -254,7 +256,6 @@ class TorqueEstimator(ParameterEstimator):
       self.filtered_params[param].update_alpha(self.decay)
 
   def handle_log(self, t, which, msg):
-    self.lag = ntune_common_get('steerActuatorDelay')+.2
     if which == "carControl":
       self.raw_points["carControl_t"].append(t + self.lag)
       self.raw_points["lat_active"].append(msg.latActive)
@@ -299,32 +300,25 @@ class TorqueEstimator(ParameterEstimator):
     liveTorqueParameters = msg.liveTorqueParameters
     liveTorqueParameters.version = VERSION
     liveTorqueParameters.useParams = self.use_params
-
     self.checkNTune()
+    
+    # Calculate raw estimates when possible, only update filters when enough points are gathered
+    if self.filtered_points.is_calculable():
+      latAccelFactor, latAccelOffset, frictionCoeff = self.estimate_params()
+      liveTorqueParameters.latAccelFactorRaw = float(latAccelFactor)
+      liveTorqueParameters.latAccelOffsetRaw = float(latAccelOffset)
+      liveTorqueParameters.frictionCoefficientRaw = float(frictionCoeff)
 
-    try:
-
-      # Calculate raw estimates when possible, only update filters when enough points are gathered
-      if self.filtered_points.is_calculable():
-        latAccelFactor, latAccelOffset, frictionCoeff = self.estimate_params()
-        liveTorqueParameters.latAccelFactorRaw = float(latAccelFactor)
-        liveTorqueParameters.latAccelOffsetRaw = float(latAccelOffset)
-        liveTorqueParameters.frictionCoefficientRaw = float(frictionCoeff)
-
-        if self.filtered_points.is_valid():
-          if any(val is None or np.isnan(val) for val in [latAccelFactor, latAccelOffset, frictionCoeff]):
-            cloudlog.exception("Live torque parameters are invalid.")
-            liveTorqueParameters.liveValid = False
-            self.reset()
-          else:
-            liveTorqueParameters.liveValid = True
-            latAccelFactor = np.clip(latAccelFactor, self.min_lataccel_factor, self.max_lataccel_factor)
-            frictionCoeff = np.clip(frictionCoeff, self.min_friction, self.max_friction)
-            self.update_params({'latAccelFactor': latAccelFactor, 'latAccelOffset': latAccelOffset, 'frictionCoefficient': frictionCoeff})
-
-
-    except:
-      pass
+      if self.filtered_points.is_valid():
+        if any(val is None or np.isnan(val) for val in [latAccelFactor, latAccelOffset, frictionCoeff]):
+          cloudlog.exception("Live torque parameters are invalid.")
+          liveTorqueParameters.liveValid = False
+          self.reset()
+        else:
+          liveTorqueParameters.liveValid = True
+          latAccelFactor = np.clip(latAccelFactor, self.min_lataccel_factor, self.max_lataccel_factor)
+          frictionCoeff = np.clip(frictionCoeff, self.min_friction, self.max_friction)
+          self.update_params({'latAccelFactor': latAccelFactor, 'latAccelOffset': latAccelOffset, 'frictionCoefficient': frictionCoeff})
 
     if with_points:
       liveTorqueParameters.points = self.filtered_points.get_points()[:, [0, 2]].tolist()
@@ -354,7 +348,7 @@ def main(demo=False):
   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   estimator = TorqueEstimator(CP)
 
-  lag_estimator = LagEstimator(CP, DT_MDL)
+  lag_estimator = LagEstimator(CP, DT_MDL, MIN_HIST_LEN_SEC, MAX_HIST_LEN_SEC, MAX_LAG_HIST_LEN_SEC, MOVING_CORR_WINDOW, OVERLAP_FACTOR)
 
   while True:
     sm.update()
