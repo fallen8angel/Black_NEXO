@@ -7,6 +7,7 @@ from cereal import car
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, DT_CTRL
 from openpilot.selfdrive.locationd.helpers import ParameterEstimator
+from openpilot.selfdrive.controls.ntune import ntune_torque_get, ntune_common_get
 
 MIN_LAG_VEL = 15.0
 MAX_SANE_LAG = 3.0
@@ -18,7 +19,7 @@ class LagEstimator(ParameterEstimator):
   def __init__(self, CP, dt, pub_dt, max_lag_hist_len_sec, moving_corr_window):
     self.dt = dt
     self.window_len = int(moving_corr_window / self.dt)
-    self.initial_lag = CP.steerActuatorDelay
+    self.initial_lag = ntune_common_get('steerActuatorDelay') + .2
     self.current_lag = self.initial_lag
 
     self.lat_active = False
@@ -110,7 +111,7 @@ def main():
     if sm.frame % 25 == 0:
       msg = estimator.get_msg(sm.all_checks(), with_points=True)
       alert_msg = messaging.new_message('alertDebug')
-      alert_msg.alertDebug.alertText1 = f"Lag estimate (fixed: {CP.steerActuatorDelay:.2f} s)"
+      alert_msg.alertDebug.alertText1 = f"Lag estimate (fixed: {ntune_common_get('steerActuatorDelay') + .2:.2f} s)"
       alert_msg.alertDebug.alertText2 = f"{msg.liveActuatorDelay.steerActuatorDelay:.2f} s"
 
       pm.send('liveActuatorDelay', msg)
